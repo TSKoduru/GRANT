@@ -42,11 +42,10 @@ class CameraIntrinsics:
 
 @dataclass
 class RGBDFrame:
-    """Aligned RGB + depth capture. arm_mask is filled in by ArmSegmenter."""
+    """Aligned RGB + depth capture from the stereo rig."""
     rgb: np.ndarray                 # H x W x 3, uint8
     depth: np.ndarray               # H x W, float32 meters
     intrinsics: CameraIntrinsics
-    arm_mask: Optional[np.ndarray] = None   # H x W bool, True = arm pixel
 
 
 @dataclass
@@ -73,11 +72,22 @@ class ObjectState:
 
 
 @dataclass
+class CapturedView:
+    """
+    One RGBD capture paired with the camera pose it was taken from.
+    TSDF fusion needs both: the depth image goes into the volume, and the
+    pose tells TSDF where the camera was in world space.
+    """
+    frame: RGBDFrame
+    camera_pose: Pose6D             # camera-to-world
+
+
+@dataclass
 class ScanResult:
     mesh: Any                       # o3d.geometry.TriangleMesh
     point_cloud: PointCloud
-    coverage_achieved: float
     n_frames: int
+    alignment_fitness: float = 0.0   # RANSAC+ICP fitness for orientation-2 → orientation-1
 
 
 class ScanError(RuntimeError):
