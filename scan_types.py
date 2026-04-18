@@ -6,7 +6,7 @@ them with concrete geometry / image types, but every module in the project
 imports from here so signatures stay consistent.
 """
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 
@@ -46,14 +46,14 @@ class RGBDFrame:
     rgb: np.ndarray                 # H x W x 3, uint8
     depth: np.ndarray               # H x W, float32 meters
     intrinsics: CameraIntrinsics
-    arm_mask: np.ndarray | None = None   # H x W bool, True = arm pixel
+    arm_mask: Optional[np.ndarray] = None   # H x W bool, True = arm pixel
 
 
 @dataclass
 class PointCloud:
     """World- or camera-space points with optional colors."""
     points: np.ndarray              # N x 3 float32
-    colors: np.ndarray | None = None  # N x 3 uint8
+    colors: Optional[np.ndarray] = None  # N x 3 uint8
 
     @staticmethod
     def empty() -> "PointCloud":
