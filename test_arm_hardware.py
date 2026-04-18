@@ -48,28 +48,26 @@ def set_joint_angles(arm, shoulder_pan_angle, shoulder_lift_angle, elbow_flex_an
     print(f"New Joint Angles (radians): {new_angles}")
 
     # Optionally, print the current pose after moving to the specified joint angles
-    pose = arm.get_current_pose()
-    print(f"New Pose after setting specified joint angles: {pose}")
+    # pose = arm.get_current_pose()
+    # print(f"New Pose after setting specified joint angles: {pose}")
 
     for angle in [-90, 0, 90, 180]:
         time.sleep(2)
         action_dict['wrist_roll.pos'] = angle
         arm.robot.send_action(action_dict)
-        pose = arm.get_current_pose()
+        pose = arm.get_joint_angles()
         print(f"New Pose after setting specified joint angles: {pose}")
 
 
 if __name__ == "__main__":
     # Example: Set all joint angles
     arm = init_arm()
-    new_angles = arm.get_joint_angles().values
-    print(f"New Joint Angles (radians): {new_angles}")
-    # shoulder_pan_angle = 0 # radians (example)
-    # shoulder_lift_angle = 0 # radians (example)
-    # elbow_flex_angle = 0 # radians (example)
-    # wrist_flex_angle = 90# radians (example)
-    # wrist_roll_angle = -180  # radians (example)
-    # gripper_angle = 0 # radians (example)
+    shoulder_pan_angle = 0 # radians (example)
+    shoulder_lift_angle = 0 # radians (example)
+    elbow_flex_angle = 0 # radians (example)
+    wrist_flex_angle = 90# radians (example)
+    wrist_roll_angle = -180  # radians (example)
+    gripper_angle = 45 # radians (example)
 
-    # # Call the function with the specified angles
-    # set_joint_angles(arm, shoulder_pan_angle, shoulder_lift_angle, elbow_flex_angle, wrist_flex_angle, wrist_roll_angle, gripper_angle)
+    # Call the function with the specified angles
+    set_joint_angles(arm, shoulder_pan_angle, shoulder_lift_angle, elbow_flex_angle, wrist_flex_angle, wrist_roll_angle, gripper_angle)

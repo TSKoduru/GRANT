@@ -37,9 +37,9 @@ class RoboticArm:
     """
 
     OVERHEAD_HEIGHT = 0.22              # meters above table for overhead scan position
-    WRIST_ROLL_SCAN_ANGLES = [-90.0, 0.0, 90.0, 180.0]  # degrees — one full rotation in 4 steps
+    WRIST_ROLL_SCAN_ANGLES = [-90.0, 0.0, 90.0]  # degrees — stop at +90 to avoid mechanical limit
 
-    def __init__(self, port: str = "/dev/ttyACM0", urdf_path: str = "models/so101.urdf"):
+    def __init__(self, port: str = "/dev/ttyACM0", urdf_path: str = "models/so101.urdf", robot_id: str = "ID0"):
         # Scan tuning parameters
         self.sweep_height = 0.15       # meters above target
         self.sweep_half_length = 0.1  # meters
@@ -53,7 +53,7 @@ class RoboticArm:
         
         # 2. Setup LeRobot Hardware (Degrees)
         print(f"[RoboticArm] Connecting LeRobot to {port}...")
-        config = SO101FollowerConfig(port=port, use_degrees=True)
+        config = SO101FollowerConfig(port=port, use_degrees=True, id=robot_id)
         self.robot = SO101Follower(config)
         self.robot.connect()
         print("[RoboticArm] Hardware connection successful.")
@@ -152,11 +152,37 @@ class RoboticArm:
             full[idx] = val
         return np.array(full)
 
+    def plan_pose_angles(self, pose: Pose6D, phase: str = "grip") -> np.ndarray:
+        """Compute IK joint angles (degrees, J1–J5) for a pose without moving."""
+        target_pos = [pose.x, pose.y, pose.z]
+        current_angles = self.get_joint_angles().values
+
+        if phase == "scan":
+            current_ee_pos = self.chain.forward_kinematics(current_angles)[:3, 3]
+            target_pointing_vec = np.array(target_pos) - current_ee_pos
+            norm = np.linalg.norm(target_pointing_vec)
+            if norm > 1e-6:
+                target_pointing_vec /= norm
+            target_angles = self._solve_orientation_only(
+                target_pointing_vec, np.array(target_pos), current_angles
+            )
+        else:
+            target_angles = self.chain.inverse_kinematics(
+                target_position=target_pos,
+                target_orientation=None,
+                orientation_mode=None,
+                initial_position=current_angles,
+            )
+
+        return np.rad2deg(target_angles[1:6])
+
     def move_to_pose(self, pose: Pose6D, speed: float = 0.3, phase: str = "grip") -> ArmMoveResult:
         target_pos = [pose.x, pose.y, pose.z]
         rot_matrix = R.from_quat([pose.qx, pose.qy, pose.qz, pose.qw]).as_matrix()
         target_pointing_vec = rot_matrix[:, 2]
         current_angles = self.get_joint_angles().values
+
+        success, error_val, message = True, 0.0, "OK"
 
         if phase == "scan":
             current_ee_pos = self.chain.forward_kinematics(current_angles)[:3, 3]
@@ -165,7 +191,7 @@ class RoboticArm:
 
             target_angles = self._solve_orientation_only(
                 target_pointing_vec,
-                np.array(target_pos),   # pass the full XYZ target so Z is anchored
+                np.array(target_pos),
                 current_angles
             )
 

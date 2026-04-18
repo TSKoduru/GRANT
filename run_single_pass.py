@@ -84,16 +84,12 @@ def main():
 
     # ── Move to overhead position ────────────────────────────────────
     target = object_state.centroid_as_pose()
-    overhead = {
-        'shoulder_pan.pos': 0,  # J1
-        'shoulder_lift.pos': 0,  # J2
-        'elbow_flex.pos': 0,    # J3
-        'wrist_flex.pos': 90,    # J4 (Pitch)
-        'wrist_roll.pos': -90,    # J5 (Roll)
-        'gripper.pos': 0      # Gripper position (unchanged)
-    }
-    arm.robot.send_action(overhead)
-    time.sleep(2)
+    overhead_pose = arm.get_overhead_pose(target)
+    print(f"[run_single_pass] Moving to overhead: x={overhead_pose.x:.3f}, y={overhead_pose.y:.3f}, z={overhead_pose.z:.3f}")
+    result = arm.move_to_pose(overhead_pose, phase="grip")
+    print(f"[run_single_pass] Overhead move: {result.message}")
+    if not result.success:
+        print("[run_single_pass] Warning: IK error > 15 mm — check object coordinates.")
 
     # ── Wrist-roll scan: 4 captures ──────────────────────────────────
     print(f"[run_single_pass] Scanning at wrist-roll angles: {arm.WRIST_ROLL_SCAN_ANGLES}")
