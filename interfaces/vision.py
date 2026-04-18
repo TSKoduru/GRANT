@@ -18,13 +18,9 @@ class VisionSystem:
         Returns bounding box, centroid, initial coverage map (all zeros).
         """
 
-    def frame_to_pointcloud(
-        self,
-        frame: RGBDFrame,                 # arm_mask already applied
-    ) -> PointCloud:
+    def frame_to_pointcloud(self, frame: RGBDFrame) -> PointCloud:
         """
         Backprojects depth map through camera intrinsics to 3D points.
-        Applies arm_mask before backprojection.
         Colors from RGB frame.
         Returns point cloud in camera space — caller transforms to world space.
         """

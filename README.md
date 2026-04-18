@@ -1,41 +1,33 @@
 # GRANT
 
-A two-armed 3D scanning pipeline. One arm **holds** the object, the other arm **looks** at it. The orchestrator moves the viewing arm around, captures RGB-D frames, fuses them into a point cloud, and runs Poisson reconstruction to produce a mesh. It keeps going until coverage crosses a threshold or information gain flattens out.
+A single-arm 3D scanning pipeline. One 6-DoF arm carries both a stereo depth camera and a suction gripper, so the same arm that sweeps the camera around an object also flips the object over between scans. The gripper is mounted so it's out of frame whenever the camera is aimed at the object — no arm-segmentation step is needed.
 
-Everything in this repo is currently **interface stubs**. No method has a body — the shapes are frozen so the subsystems can be implemented in parallel against the same contract.
+The reconstruction path (`registration.py`, `orchestrator.py`) is fully implemented. Hardware-facing modules are interface stubs.
 
 ---
 
-## How the pieces fit together
+## Algorithm overview
 
 ```
                        ┌────────────────────────┐
                        │   ScanOrchestrator     │
                        │   (orchestrator.py)    │
                        └───────────┬────────────┘
-                                   │ drives
-     ┌──────────────┬──────────────┼──────────────┬──────────────┐
-     │              │              │              │              │
-     ▼              ▼              ▼              ▼              ▼
-┌─────────┐   ┌──────────┐   ┌──────────┐   ┌───────────┐   ┌──────────────┐
-│CameraArm│   │PickupArm │   │ Vision   │   │ Coverage  │   │Registration  │
-│(looks)  │   │ (holds)  │   │ (KV260)  │   │   Map     │   │ (world-space │
-│         │   │          │   │          │   │           │   │   fusion)    │
-└─────────┘   └──────────┘   └────┬─────┘   └─────┬─────┘   └──────┬───────┘
-                                  │               │                │
-                                  ▼               ▼                ▼
-                              RGBDFrame   (picks next pose)   PointCloud
-                                  │                                │
-                                  └──────────┬─────────────────────┘
-                                             ▼
-                                      ┌──────────────┐
-                                      │ArmSegmenter  │
-                                      │(masks pickup │
-                                      │ arm pixels)  │
-                                      └──────────────┘
+                                   │
+            ┌──────────────────────┼──────────────────────┐
+            ▼                      ▼                      ▼
+     ┌──────────────┐       ┌─────────────┐        ┌──────────────┐
+     │ RoboticArm   │       │   Vision    │        │Registration  │
+     │ (camera +    │       │   (KV260    │        │ (align +     │
+     │  gripper)    │       │    stereo)  │        │   fuse)      │
+     └──────────────┘       └──────┬──────┘        └──────┬───────┘
+                                   │                      │
+                                   ▼                      ▼
+                              RGBDFrame +           Mesh (TSDF)
+                              CapturedView
 ```
 
-Data types used at every seam live in [scan_types.py](scan_types.py): `Pose6D`, `JointAngles`, `RGBDFrame`, `PointCloud`, `ObjectState`, `CameraIntrinsics`, `ScanResult`, `ScanError`.
+Types live in [scan_types.py](scan_types.py): `Pose6D`, `JointAngles`, `RGBDFrame`, `PointCloud`, `ObjectState`, `CameraIntrinsics`, `CapturedView`, `ScanResult`, `ScanError`.
 
 > ⚠️ The module is `scan_types`, **not** `types` — `types` shadows Python's stdlib and breaks the interpreter.
 
@@ -43,103 +35,145 @@ Data types used at every seam live in [scan_types.py](scan_types.py): `Pose6D`, 
 
 ## File map
 
-| File | Role |
-| --- | --- |
-| [orchestrator.py](orchestrator.py) | `ScanOrchestrator.run_full_scan()`. Entry point. Owns the phase loop. |
-| [interfaces/camera_arm.py](interfaces/camera_arm.py) | Viewing arm: moves the stereo rig, reports joint/pose state. |
-| [interfaces/pickup_arm.py](interfaces/pickup_arm.py) | Holding arm: suction pickup, wrist rotate, release. |
-| [interfaces/vision.py](interfaces/vision.py) | KV260 stereo capture → `RGBDFrame`; depth backprojection → `PointCloud`. |
-| [coverage.py](coverage.py) | Elevation/azimuth sphere tracking which patches of surface have been seen. Picks next viewpoint + next object rotation. |
-| [registration.py](registration.py) | Camera → world transform, ICP merge, Poisson mesh reconstruction. |
-| [arm_segmenter.py](arm_segmenter.py) | Removes pickup-arm pixels from each frame (geometric → color → depth refinement). |
-| [scan_types.py](scan_types.py) | Shared dataclass stubs used by every module. |
+| File | Role | Status |
+| --- | --- | --- |
+| [orchestrator.py](orchestrator.py) | `ScanOrchestrator.run_full_scan()`. Drives the fixed 4-arc scan + flip + alignment + TSDF. | **Implemented** |
+| [registration.py](registration.py) | Per-view transforms, ICP merge, global RANSAC+ICP align, TSDF fusion, Poisson fallback. | **Implemented** |
+| [scripts/test_mesh_reconstruction.py](scripts/test_mesh_reconstruction.py) | Synthetic end-to-end test (raycast depth + simulated flip). No hardware required. | **Implemented** |
+| [scan_types.py](scan_types.py) | Shared dataclasses used at every seam. | **Implemented** |
+| [interfaces/robotic_arm.py](interfaces/robotic_arm.py) | The single arm. Camera sweep (`get_arc_trajectory`, `move_to_pose`) and gripping (`pickup_object`, `flip_object`, `release_object`) on one interface. | Stub |
+| [interfaces/vision.py](interfaces/vision.py) | KV260 stereo capture + depth backprojection. | Stub |
+| [coverage.py](coverage.py) | Not used in the fixed algorithm. Retained as a design reference. | Legacy |
+
+### Single-arm tradeoffs
+
+What we gain: simpler hardware, no second-arm coordination.
+
+What we lose: no independent seal-detection sensor during pickup. The arm still commands the suction cup, but `GripResult.success` reports only whether the approach+grip motion executed — it can't confirm that the cup actually sealed. We rely on the FK-based approach pose to land accurately, and on the next capture to reveal a failed grip (the object will have moved unexpectedly).
 
 ---
 
-## The scan loop ([orchestrator.py:32](orchestrator.py#L32))
+## The scan flow ([orchestrator.py](orchestrator.py))
 
-**Phase 1 — Initialization**
-1. `vision.capture_rgbd()` → first frame
-2. `vision.detect_object(frame)` → `ObjectState` (centroid + bbox)
-3. `pickup_arm.pickup_object(centroid_as_pose)` → grip. If it fails, raise `ScanError`.
+**Phase 1 — Detect object**: `vision.capture_rgbd()` + `vision.detect_object(frame)` → `ObjectState` (centroid + bbox). The object sits on the table — it is **not** held during capture.
 
-**Phase 2 — Capture loop**, until either `COVERAGE_TARGET` is met, `MAX_ITERATIONS` is hit, or expected gain drops below `MIN_NEW_COVERAGE`:
-1. `coverage_map.get_next_object_rotation()` — rotate the object if the best unseen regions face away.
-2. `coverage_map.get_next_viewpoint(object_state, camera_arm.get_reachable_poses())` — pick the pose with highest expected information gain.
-3. `camera_arm.move_to_pose(next_camera_pose)`
-4. `vision.capture_rgbd()` → frame
-5. `arm_segmenter.get_mask(frame, pickup_arm.get_joint_angles(), camera_arm.get_current_pose())` — write `frame.arm_mask` so the holding arm's pixels don't pollute the cloud.
-6. `vision.frame_to_pointcloud(frame)` → camera-space cloud
-7. `registration.transform_to_world(cloud, camera_pose)` → world-space cloud
-8. `registration.merge(accumulated, new_cloud)` — ICP-refined fusion
-9. `coverage_map.update(frame, camera_pose, object_state)`
+**Phase 2 — Orientation 1**: `_run_both_arcs(object_state)`
+1. `arm.get_arc_trajectory("azimuth", …)` → left-to-right sweep.
+2. `arm.get_arc_trajectory("elevation", …)` → top-to-bottom sweep.
+3. For each pose: `arm.move_to_pose`, then `vision.capture_rgbd`, stored as `CapturedView(frame, pose)`.
 
-**Phase 3 — Finalize**
-1. `pickup_arm.rotate_to_angle(0.0)`, `release_object()`
-2. `camera_arm.move_to_home()`
-3. `registration.reconstruct_mesh(accumulated_cloud)` → Poisson mesh
-4. Return `ScanResult(mesh, point_cloud, coverage_achieved, n_frames)`
+**Phase 3 — Flip**: `_flip_object_in_place(centroid)`
+1. `arm.pickup_object(target_pose=centroid)` — FK-approach + suction.
+2. `arm.flip_object()` — rotates ~180° about a horizontal axis and sets the object back on the table.
+3. `arm.release_object()`.
+
+**Phase 4 — Re-detect**: the flip won't land the object at exactly the same spot, so `detect_object` runs again to pick up the new centroid.
+
+**Phase 5 — Orientation 2**: identical to Phase 2, new centroid.
+
+**Phase 6 — Home**: `arm.move_to_home()`.
+
+**Phase 7 — Cross-orientation alignment**
+1. Fuse each orientation's views into a single world-space cloud (`transform_to_world` + ICP-refined `merge`).
+2. `registration.global_align(source=cloud_2, target=cloud_1)` → `(T, fitness)`. RANSAC on FPFH features finds a coarse alignment across the ~180° flip, then ICP refines on the full clouds.
+3. Abort with `ScanError` if `fitness < MIN_ALIGNMENT_FITNESS` (0.3) — too little surface overlap.
+4. `apply_transform_to_views(views_orient_2, T)` rewrites every orientation-2 pose into orientation-1's frame.
+
+**Phase 8 — TSDF fusion**: `registration.tsdf_fuse(all_views)` integrates every frame's depth into a `ScalableTSDFVolume` and extracts the mesh. Returns `ScanResult`.
+
+### Why RANSAC + ICP + TSDF
+
+- **RANSAC** handles the ~180° flip. ICP started from identity would lock onto a local minimum.
+- **ICP** refines RANSAC's cm-level output to sub-mm on the full-resolution clouds.
+- **TSDF** weights each view by viewing angle and distance automatically and produces a watertight mesh without Poisson's normal-orientation headaches.
 
 ---
 
-## Tuning knobs (class constants on `ScanOrchestrator`)
+## Tuning knobs
 
+### `ScanOrchestrator`
 | Constant | Meaning | Default |
 | --- | --- | --- |
-| `COVERAGE_TARGET` | Stop once this fraction of the surface sphere is observed. | `0.92` |
-| `MAX_ITERATIONS` | Hard cap on capture attempts per scan. | `24` |
-| `MIN_NEW_COVERAGE` | Break early if the best next viewpoint adds less than this. | `0.02` |
+| `ARC_STEPS_AZIMUTH` | Frames per left→right sweep. | `12` |
+| `ARC_STEPS_ELEVATION` | Frames per top→bottom sweep. | `8` |
+| `MIN_ALIGNMENT_FITNESS` | Abort threshold for cross-orientation alignment. | `0.3` |
+
+### `Registration`
+| Constant | Effect |
+| --- | --- |
+| `VOXEL_SIZE` | Downsample grid after each merge. 2mm; tighter = more detail + memory. |
+| `ICP_MAX_DIST` | ICP correspondence threshold. Bigger than FK drift, smaller than object features. |
+| `GLOBAL_VOXEL_SIZE` | Downsample for FPFH feature extraction. 5mm. |
+| `RANSAC_MAX_CORR_DIST` | RANSAC inlier threshold (`1.5 × GLOBAL_VOXEL_SIZE`). |
+| `TSDF_VOXEL` | Output mesh resolution. 2mm. |
+| `TSDF_TRUNC` | Signed-distance truncation band (`4 × TSDF_VOXEL`). |
+| `TSDF_DEPTH_TRUNC` | Ignore depth past this (meters). |
+| `POISSON_DEPTH` | Octree depth for Poisson fallback. 8 fast / 10 slow. |
 
 ---
 
-## Implementing a module
+## Running the reconstruction pipeline
 
-1. Pick a file from the table above.
-2. Keep the existing signatures — the orchestrator (and other modules) rely on them.
-3. Import types from `.scan_types`, not `.types`.
-4. Parameter order and names are part of the contract, since [orchestrator.py](orchestrator.py) calls several of them as keyword arguments (e.g. `target_pose=`, `camera_pose=`, `joint_angles=`).
-
-### Recommended implementation order
-
-1. **`scan_types.py`** — already fleshed out; tighten fields as you need them.
-2. **`interfaces/vision.py`** — nothing else is testable without frames.
-3. **`interfaces/camera_arm.py`** and **`interfaces/pickup_arm.py`** — hardware drivers.
-4. **`registration.py`** — pure function of `PointCloud` + `Pose6D`, easy to unit-test with synthetic clouds.
-5. **`arm_segmenter.py`** — needs URDF + calibrated HSV range. `calibrate_arm_color()` at startup, once, with no object present.
-6. **`coverage.py`** — last, because its quality depends on the others working.
-7. **`orchestrator.py`** — already wired up; mostly untouched once the above exist.
-
----
-
-## Running it
-
-The package is importable from its parent directory:
-
-```bash
-cd /path/to/projects
-python -c "from GRANT.orchestrator import ScanOrchestrator"
-```
-
-A minimal harness looks like:
+Minimal real-hardware harness (raises at the first stub call — that's expected):
 
 ```python
 from GRANT.orchestrator import ScanOrchestrator
-from GRANT.coverage import CoverageMap
 from GRANT.registration import Registration
-from GRANT.arm_segmenter import ArmSegmenter
-from GRANT.interfaces.camera_arm import CameraArm
-from GRANT.interfaces.pickup_arm import PickupArm
+from GRANT.interfaces.robotic_arm import RoboticArm
 from GRANT.interfaces.vision import VisionSystem
 
 orch = ScanOrchestrator(
-    camera_arm=CameraArm(),
-    pickup_arm=PickupArm(),
+    arm=RoboticArm(),
     vision=VisionSystem(),
-    coverage_map=CoverageMap(),
     registration=Registration(),
-    arm_segmenter=ArmSegmenter(arm_urdf_path="...", camera_intrinsics=...),
 )
 result = orch.run_full_scan()
+print(f"{result.n_frames} frames, alignment fitness {result.alignment_fitness:.2f}")
 ```
 
-This will raise at the first stub call — the interfaces compile but have no bodies yet. That's the expected state while subsystems are being built out.
+---
+
+## Running the synthetic test
+
+`scripts/test_mesh_reconstruction.py` runs the full pipeline on raycast synthetic data. **Three invocations all work** — pick whichever fits where you're standing in the shell:
+
+```bash
+# From inside GRANT/
+python scripts/test_mesh_reconstruction.py
+
+# From GRANT's parent directory
+python GRANT/scripts/test_mesh_reconstruction.py
+python -m GRANT.scripts.test_mesh_reconstruction
+```
+
+Example runs:
+
+```bash
+python scripts/test_mesh_reconstruction.py --shape bunny
+python scripts/test_mesh_reconstruction.py --shape box --n-az 16 --n-el 10
+python scripts/test_mesh_reconstruction.py --shape armadillo --visualize
+python scripts/test_mesh_reconstruction.py --no-tsdf       # use Poisson instead of TSDF
+```
+
+Flags: `--noise-std` (m), `--fk-drift-std` (m), `--flip-drift-std` (m), `--radius` (m), `--n-az`, `--n-el`, `--seed`.
+
+### Common import errors
+
+| Error | Fix |
+| --- | --- |
+| `ModuleNotFoundError: No module named 'open3d'` | `pip install open3d` (and `numpy` if you don't have it). |
+| `ModuleNotFoundError: No module named 'GRANT'` | You ran `python -m GRANT.…` from the wrong directory — you need to be in GRANT's *parent* directory. Or just use `python scripts/test_mesh_reconstruction.py` from inside GRANT/. |
+| `ImportError: attempted relative import with no known parent package` | Shouldn't happen anymore — the script has a `sys.path` shim at the top. If it still does, check that `GRANT/__init__.py` and `GRANT/scripts/__init__.py` both exist (they should be empty files). |
+| `ImportError: cannot import name 'MappingProxyType' from partially initialized module 'types'` | You have a file named `types.py` somewhere — it's shadowing Python's stdlib. Ours is called `scan_types.py` for exactly this reason. |
+
+### Benchmarks
+
+On a 10cm object with 0.8mm sensor noise and 2mm FK drift:
+
+| Shape | TSDF | Poisson (`--no-tsdf`) |
+| --- | --- | --- |
+| Bunny | ~3.2mm chamfer | ~1.7mm |
+| Box | ~3.2mm | — |
+| Sphere | ~3.5mm | — |
+
+TSDF bottoms out at roughly the FK-drift scale — expected. For tight FK, TSDF wins on larger / more-featured objects; for noisy FK, the ICP-refined Poisson path is more forgiving on small ones.
