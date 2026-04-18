@@ -1,3 +1,5 @@
+import sys
+import os
 import cv2
 import numpy as np
 
@@ -71,6 +73,18 @@ def visualize_rgbd(frame: RGBDFrame):
 
 
 if __name__ == "__main__":
+    # 1. Check if the user provided a filename argument
+    if len(sys.argv) < 2:
+        print("Usage: python3 decode_npz.py <path_to_npz_file>")
+        sys.exit(1)
+        
+    target_file = sys.argv[1]
+    
+    # 2. Check if the provided file actually exists
+    if not os.path.exists(target_file):
+        print(f"Error: The file '{target_file}' does not exist.")
+        sys.exit(1)
+
     # Dummy intrinsics required by the RGBDFrame dataclass
     dummy_intrinsics = CameraIntrinsics(
         fx=1000.0, fy=1000.0, 
@@ -78,11 +92,8 @@ if __name__ == "__main__":
         width=1280, height=960
     )
     
-    # Replace with your actual saved file name
-    target_file = "scan_frame_1776490226.npz"
-    
     try:
-        # Load the frame
+        # Load the frame using the command-line argument
         frame = load_rgbd_from_npz(target_file, dummy_intrinsics)
         print(f"Successfully loaded {target_file}")
         
