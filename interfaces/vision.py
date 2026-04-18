@@ -3,41 +3,43 @@ import numpy as np
 import depthai as dai
 from datetime import timedelta
 
-from ..scan_types import ObjectState, PointCloud, RGBDFrame, CameraIntrinsics
+try:
+    from ..scan_types import ObjectState, PointCloud, Pose6D, RGBDFrame, CameraIntrinsics, ScanError
+except ImportError:
+    from scan_types import ObjectState, PointCloud, Pose6D, RGBDFrame, CameraIntrinsics, ScanError
 
 class VisionSystem:
     def __init__(self):
-        """
-        Initializes the DepthAI pipeline, nodes, and starts the device.
-        """
         self.fps = 25.0
         self.pipeline = dai.Pipeline()
-        self.device = self.pipeline.getDefaultDevice()
-        self.platform = self.device.getPlatform()
 
-        # Define sources and outputs
+        # Get device reference once — used for platform check and calibration.
+        # Must be called before node creation, same as depth_align.py.
+        device = self.pipeline.getDefaultDevice()
+        platform = device.getPlatform()
+
+        # ── Node setup — identical topology to depth_align.py ────────
         camRgb = self.pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
-        left = self.pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
-        right = self.pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
+        left   = self.pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
+        right  = self.pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
         stereo = self.pipeline.create(dai.node.StereoDepth)
-        sync = self.pipeline.create(dai.node.Sync)
+        sync   = self.pipeline.create(dai.node.Sync)
 
-        if self.platform == dai.Platform.RVC4:
+        if platform == dai.Platform.RVC4:
             align = self.pipeline.create(dai.node.ImageAlign)
 
         stereo.setExtendedDisparity(True)
-        sync.setSyncThreshold(timedelta(seconds=1/(2*self.fps)))
+        sync.setSyncThreshold(timedelta(seconds=1 / (2 * self.fps)))
 
-        rgbOut = camRgb.requestOutput(size=(1280, 960), fps=self.fps, enableUndistortion=True)
-        leftOut = left.requestOutput(size=(640, 400), fps=self.fps)
+        rgbOut   = camRgb.requestOutput(size=(1280, 960), fps=self.fps, enableUndistortion=True)
+        leftOut  = left.requestOutput(size=(640, 400), fps=self.fps)
         rightOut = right.requestOutput(size=(640, 400), fps=self.fps)
 
-        # Linking
         rgbOut.link(sync.inputs["rgb"])
         leftOut.link(stereo.left)
         rightOut.link(stereo.right)
 
-        if self.platform == dai.Platform.RVC4:
+        if platform == dai.Platform.RVC4:
             stereo.depth.link(align.input)
             rgbOut.link(align.inputAlignTo)
             align.outputAligned.link(sync.inputs["depth_aligned"])
@@ -47,21 +49,23 @@ class VisionSystem:
 
         self.queue = sync.out.createOutputQueue()
 
-        # Start the pipeline
+        # ── Start pipeline — mirrors 'with pipeline: pipeline.start()' ─
+        # depth_align.py uses the context manager for device lifecycle;
+        # for a long-lived class we enter it explicitly so capture_rgbd
+        # can be called repeatedly without re-starting the pipeline.
+        self.pipeline.__enter__()
         self.pipeline.start()
 
-        # Attempt to read exact camera intrinsics; provide fallback if calibration fails.
-        # IMPORTANT: pass resize dimensions — calibration stores intrinsics at the
-        # sensor's native resolution, so without resize args the fx/fy/cx/cy will not
-        # match the 1280x960 RGB output and point-cloud backprojection will be skewed.
+        # ── Calibration ───────────────────────────────────────────────
+        # IMPORTANT: pass resize dims — calibration stores intrinsics at
+        # native sensor resolution, not at the 1280×960 RGB output size.
         try:
-            calibData = self.device.readCalibration()
-            intrinsics_matrix = calibData.getCameraIntrinsics(
-                dai.CameraBoardSocket.CAM_A, resizeWidth=1280, resizeHeight=960,
+            calib = device.readCalibration()
+            M = calib.getCameraIntrinsics(
+                dai.CameraBoardSocket.CAM_A, resizeWidth=1280, resizeHeight=960
             )
             self.intrinsics = CameraIntrinsics(
-                fx=intrinsics_matrix[0][0], fy=intrinsics_matrix[1][1],
-                cx=intrinsics_matrix[0][2], cy=intrinsics_matrix[1][2],
+                fx=M[0][0], fy=M[1][1], cx=M[0][2], cy=M[1][2],
                 width=1280, height=960,
             )
         except Exception:
@@ -69,27 +73,33 @@ class VisionSystem:
                 fx=1000.0, fy=1000.0, cx=640.0, cy=480.0, width=1280, height=960,
             )
 
+    def close(self):
+        """Stop the pipeline and release the OAK-D device."""
+        self.pipeline.__exit__(None, None, None)
+
     def capture_rgbd(self) -> RGBDFrame:
         """
-        Triggers stereo capture on KV260.
-        Runs rectification + SGBM disparity → depth map.
-        Returns RGB + depth aligned to left camera frame.
-        Blocks until frame ready (~100-200ms).
+        Pulls one synchronised RGB+depth frame from the queue.
+        Mirrors depth_align.py's frame-handling exactly.
+        Blocks until a frame is ready (~100-200 ms).
         """
         messageGroup = self.queue.get()
-        frameRgb = messageGroup["rgb"]
-        frameDepth = messageGroup["depth_aligned"]
+        assert isinstance(messageGroup, dai.MessageGroup)
 
-        # 1. Process RGB
+        frameRgb   = messageGroup["rgb"]
+        frameDepth = messageGroup["depth_aligned"]
+        assert isinstance(frameRgb,   dai.ImgFrame)
+        assert isinstance(frameDepth, dai.ImgFrame)
+
+        # RGB — depth_align.py reads getCvFrame() and converts GRAY→BGR or uses as-is
         cvFrame = frameRgb.getCvFrame()
         if len(cvFrame.shape) == 2:
             rgb_array = cv2.cvtColor(cvFrame, cv2.COLOR_GRAY2RGB)
         else:
             rgb_array = cv2.cvtColor(cvFrame, cv2.COLOR_BGR2RGB)
 
-        # 2. Process Depth (Convert from mm uint16 to float32 meters per scan_types.py)
-        depth_array_mm = frameDepth.getFrame()
-        depth_array_meters = depth_array_mm.astype(np.float32) / 1000.0
+        # Depth — depth_align.py saves as getFrame().astype(float32) / 1000.0
+        depth_array_meters = frameDepth.getFrame().astype(np.float32) / 1000.0
 
         return RGBDFrame(
             rgb=rgb_array,
@@ -99,18 +109,58 @@ class VisionSystem:
 
     def detect_object(self, frame: RGBDFrame) -> ObjectState:
         """
-        Called once at scan start (and again after the flip).
-        Segments the object from background using depth discontinuities.
+        Segments the object from the table using depth discontinuities.
+        Returns the centroid and bounding box in camera space.
 
-        TODO: implement. A reasonable baseline:
-          1. Crop depth to the table region (known from the arm's workspace).
-          2. Threshold pixels whose depth is closer than the table plane.
-          3. Connected-components; pick the largest.
-          4. Centroid + axis-aligned bbox become the ObjectState.
+        NOTE: This returns coordinates in the camera frame. If the arm is at
+        home when this is called, use arm.get_current_pose() + a world→camera
+        transform to convert to world coordinates before using with move_to_pose.
+        For the single-pass test script, pass the object position manually instead.
         """
-        raise NotImplementedError(
-            "detect_object not implemented — see docstring for suggested approach"
+        depth = frame.depth
+        h, w = depth.shape
+
+        # Estimate table plane depth as the ~85th percentile of valid center pixels
+        # (table is the dominant far surface; object sticks up closer)
+        center = depth[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4]
+        valid_center = center[center > 0]
+        if len(valid_center) < 100:
+            raise ScanError("detect_object: insufficient depth data in frame center")
+        table_z = float(np.percentile(valid_center, 85))
+
+        # Object mask: valid depth at least 5 cm closer than the table plane
+        obj_mask = ((depth > 0) & (depth < table_z - 0.05)).astype(np.uint8) * 255
+
+        # Morphological open to remove salt-and-pepper noise
+        kernel = np.ones((3, 3), np.uint8)
+        obj_mask = cv2.morphologyEx(obj_mask, cv2.MORPH_OPEN, kernel)
+
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(obj_mask)
+        if n_labels < 2:
+            raise ScanError(
+                f"detect_object: no object found above table plane "
+                f"(table_z={table_z:.3f}m, threshold={table_z - 0.05:.3f}m)"
+            )
+
+        # Largest connected component (skip background label 0)
+        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        ys, xs = np.where(labels == largest)
+        zs = depth[ys, xs]
+
+        # Backproject pixel centroids to 3D camera space
+        intr = frame.intrinsics
+        x3 = (xs - intr.cx) / intr.fx * zs
+        y3 = (ys - intr.cy) / intr.fy * zs
+
+        centroid = Pose6D(
+            x=float(np.mean(x3)),
+            y=float(np.mean(y3)),
+            z=float(np.mean(zs)),
         )
+        bbox_min = np.array([x3.min(), y3.min(), zs.min()], dtype=np.float32)
+        bbox_max = np.array([x3.max(), y3.max(), zs.max()], dtype=np.float32)
+
+        return ObjectState(centroid=centroid, bbox_min=bbox_min, bbox_max=bbox_max)
 
     def frame_to_pointcloud(self, frame: RGBDFrame) -> PointCloud:
         """

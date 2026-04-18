@@ -1,6 +1,6 @@
 # GRANT
 
-A single-arm 3D scanning system. One 6-DoF arm carries a stereo depth camera and a suction gripper. For each scan the arm sweeps a **cross pattern parallel to the table** (one pass along X, one along Y), flips the object with the gripper, then sweeps the cross a second time. The two orientations are stitched with RANSAC+ICP and fused into a mesh via TSDF.
+A single-arm 3D scanning system. One 6-DoF arm carries a stereo depth camera (mounted at a downward angle) and a suction gripper. For each scan the arm moves to a fixed position **directly overhead** the object, then rotates the wrist through four angles (−90°, 0°, 90°, 180°). Because the camera is angled relative to the wrist, each rotation exposes a different side of the object to the depth sensor. After the first pass the arm flips the object with the gripper and repeats the four-angle scan. The two orientations are stitched with RANSAC+ICP and fused into a mesh via TSDF.
 
 The reconstruction pipeline (`registration.py`, `orchestrator.py`) is implemented. Hardware-facing modules have real scaffolding where possible and stubs where not.
 
@@ -48,11 +48,12 @@ Data types are shared across boards via [scan_types.py](scan_types.py).
 
 | Path | Role | Status |
 | --- | --- | --- |
-| [orchestrator.py](orchestrator.py) | `ScanOrchestrator.run_full_scan()`. Drives the cross-sweep × 2 + flip + align + TSDF. | **Implemented** |
+| [run_single_pass.py](run_single_pass.py) | Standalone single-pass test script — arm + depth camera only, no flip. Run this first. | **Implemented** |
+| [orchestrator.py](orchestrator.py) | `ScanOrchestrator.run_single_pass_scan()` + `run_full_scan()`. Overhead wrist-roll sweep × 2 + flip + align + TSDF. | **Implemented** |
 | [registration.py](registration.py) | Per-view transforms, ICP merge, global RANSAC+ICP, TSDF fusion, Poisson fallback. | **Implemented** |
 | [scan_types.py](scan_types.py) | Shared dataclasses: `Pose6D`, `RGBDFrame`, `PointCloud`, `CapturedView`, etc. | **Implemented** |
-| [interfaces/robotic_arm.py](interfaces/robotic_arm.py) | Single arm: `move_to_pose`, `get_arc_trajectory(axis="x"/"y")`, `pickup_object`, `flip_object`. | Stub |
-| [interfaces/vision.py](interfaces/vision.py) | DepthAI v3 pipeline — stereo capture + depth alignment to RGB. `frame_to_pointcloud` implemented, `detect_object` TODO. | Partial |
+| [interfaces/robotic_arm.py](interfaces/robotic_arm.py) | Single arm: `move_to_pose`, `get_overhead_pose`, `rotate_wrist_roll`, `pickup_object`, `flip_object`. | **Implemented** |
+| [interfaces/vision.py](interfaces/vision.py) | DepthAI v3 pipeline — stereo capture + depth alignment to RGB. `detect_object` implemented (depth threshold). | **Implemented** |
 | [kv260/depth_enhancement.py](kv260/depth_enhancement.py) | Bilateral + speckle + hole-fill depth cleanup. Runs on the KV260. | **Implemented** |
 | [kv260/coverage_heatmap.py](kv260/coverage_heatmap.py) | Viewing-sphere coverage tracker, emits a colored PNG. | **Implemented** |
 | [webserver/server.py](webserver/server.py) | FastAPI app: `/scan/start`, `/scan/status`, `/scan/heatmap`, `/scan/mesh`, serves dashboard. | **Implemented** |
@@ -66,19 +67,20 @@ Data types are shared across boards via [scan_types.py](scan_types.py).
 
 ## The scan flow
 
-**Phase 1 — Detect**: `vision.capture_rgbd()` + `vision.detect_object(frame)` → `ObjectState`. Object sits on the table, not held.
+**Phase 1 — Detect**: `vision.capture_rgbd()` + `vision.detect_object(frame)` → `ObjectState`. Object sits on the table, not held. `detect_object` uses depth thresholding — it estimates the table plane from the 85th-percentile depth in the centre of frame, then segments pixels at least 5 cm closer. Returns centroid + AABB in **camera space**; convert to world with FK if needed.
 
-**Phase 2 — Orientation 1**: `_run_both_arcs(object_state, phase="orient-1")`. Two legs of a cross parallel to the table:
-- `arm.get_arc_trajectory("x", target, n)` — camera moves along table X, aiming down at the object.
-- `arm.get_arc_trajectory("y", target, n)` — same along Y.
+**Phase 2 — Orientation 1**: `_run_wrist_roll_scan(object_state, phase="orient-1")`:
+- `arm.get_overhead_pose(target)` — position directly above the object at `OVERHEAD_HEIGHT` (0.22 m).
+- `arm.move_to_pose(overhead, phase="grip")` — arm moves to that position.
+- For each angle in `WRIST_ROLL_SCAN_ANGLES` (−90°, 0°, 90°, 180°): `arm.rotate_wrist_roll(angle)` → `time.sleep(SETTLE_TIME_S)` → `vision.capture_rgbd()` → store as `CapturedView(frame, pose)`.
 
-At each step: `move_to_pose` → `time.sleep(SETTLE_TIME_S)` → `vision.capture_rgbd` → store as `CapturedView(frame, pose)`. The sleep gives the camera time to de-smear after the move.
+Because the camera is angled on the wrist, rotating the wrist swings the viewing direction around the object, capturing a different portion of its surface at each stop.
 
-**Phase 3 — Flip**: `pickup_object` (no seal verification — we trust FK) → `flip_object` (~180° about a horizontal axis, set back down) → `release_object`.
+**Phase 3 — Flip**: `pickup_object` → `flip_object` (~180° about a horizontal axis) → `release_object`.
 
 **Phase 4 — Re-detect**: `detect_object` again to pick up the new centroid.
 
-**Phase 5 — Orientation 2**: same cross sweep, new centroid.
+**Phase 5 — Orientation 2**: same overhead wrist-roll scan, new centroid.
 
 **Phase 6 — Home**: `arm.move_to_home()`.
 
@@ -90,14 +92,79 @@ At each step: `move_to_pose` → `time.sleep(SETTLE_TIME_S)` → `vision.capture
 
 | Class | Constant | Effect |
 | --- | --- | --- |
-| `ScanOrchestrator` | `ARC_STEPS_X` / `ARC_STEPS_Y` | Frames per leg of the cross. |
-| `ScanOrchestrator` | `SETTLE_TIME_S` | Post-move dwell (default 0.15s). Increase if depth looks smeared. |
+| `RoboticArm` | `OVERHEAD_HEIGHT` | Camera height above table for overhead scan (default 0.22 m). |
+| `RoboticArm` | `WRIST_ROLL_SCAN_ANGLES` | Degrees to stop at during a single pass (default −90, 0, 90, 180). |
+| `ScanOrchestrator` | `SETTLE_TIME_S` | Post-rotation dwell (default 0.5 s). Increase if depth looks smeared. |
 | `ScanOrchestrator` | `MIN_ALIGNMENT_FITNESS` | Abort threshold (0.3). |
 | `Registration` | `VOXEL_SIZE`, `ICP_MAX_DIST` | Local fusion. |
 | `Registration` | `GLOBAL_VOXEL_SIZE`, `RANSAC_*` | Cross-orientation alignment. |
 | `Registration` | `TSDF_VOXEL`, `TSDF_TRUNC` | Output mesh resolution. |
 | `DepthEnhancer` | `DEPTH_MIN/MAX`, `MIN_SPECKLE_SIZE` | Per-frame depth cleanup. |
 | `CoverageHeatmap` | `N_LAT`, `N_LON`, `SPLAT_RADIUS_CELLS` | Heatmap granularity. |
+
+---
+
+## Running a single-pass scan (depth camera + arm, no flip)
+
+This is the fastest way to verify the hardware end-to-end and see a resulting mesh.
+
+### Prerequisites
+
+```bash
+pip install open3d numpy opencv-python depthai ikpy scipy lerobot
+```
+
+Connect the OAK-D over USB and the arm's serial cable (`/dev/ttyACM0` by default). Verify both are powered on.
+
+### Step 1 — Measure the object position
+
+Place the object in the arm's workspace. With a tape measure (or by moving the arm tip manually), estimate its position in the arm's world frame as (X, Y, Z) in metres. Z is the table surface. A good starting point for the default SO-101 workspace is roughly X=0.20, Y=0.00, Z=0.00.
+
+### Step 2 — Run the scan
+
+From inside the `GRANT/` directory:
+
+```bash
+# Recommended: pass the known object position
+python run_single_pass.py --object-x 0.20 --object-y 0.00 --object-z 0.00
+
+# Open the mesh viewer automatically when done
+python run_single_pass.py --object-x 0.20 --object-y 0.00 --object-z 0.00 --visualize
+
+# Auto-detect the object from depth (less reliable — arm must be at home first)
+python run_single_pass.py --auto-detect --visualize
+
+# Custom output directory and arm port
+python run_single_pass.py --object-x 0.20 --out-dir /tmp/scan --port /dev/ttyACM1
+```
+
+The script will:
+1. Move the arm overhead (height = `RoboticArm.OVERHEAD_HEIGHT`, default 0.22 m).
+2. Rotate the wrist to −90°, 0°, 90°, 180°, capturing one depth frame at each.
+3. Save a depth PNG per frame to `scan_output/` for visual inspection.
+4. Return the arm to home.
+5. TSDF-fuse the 4 frames into `scan_output/scan.ply`.
+
+### Step 3 — View the mesh
+
+```bash
+python -c "
+import open3d as o3d
+m = o3d.io.read_triangle_mesh('scan_output/scan.ply')
+o3d.visualization.draw_geometries([m], window_name='Scan')
+"
+```
+
+Or use the `--visualize` flag above to open it automatically.
+
+### Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Arm doesn't reach overhead position | Object X/Y too far from arm base | Move object closer, or increase `OVERHEAD_HEIGHT` in `robotic_arm.py` |
+| Depth PNGs are mostly black | Camera not focused (object too close/far) | Adjust `OVERHEAD_HEIGHT`; check OAK-D min focus distance (~20 cm) |
+| TSDF produces empty mesh | Depth frames have no overlap in world space | Camera angle or FK drift too large; check depth PNGs first |
+| `detect_object` error with `--auto-detect` | No object found above table plane | Object too flat, or arm not at home; use manual `--object-x/y/z` instead |
 
 ---
 
@@ -170,22 +237,22 @@ On the ESP32-S3: Arduino IDE + ESP32 board package v3.x, libraries listed in esp
 
 2. Code you still need to write (blocker order)
 
-🔴 Blocks the scan entirely
+🔴 Blocks full two-pass scan (single-pass in run_single_pass.py works without these)
 
-interfaces/robotic_arm.py	
-    Every method is a stub. Implement move_to_pose, get_current_pose, get_joint_angles, move_to_home, get_arc_trajectory("x" | "y", target, n), pickup_object, release_object, flip_object. get_arc_trajectory is pure math — produce a list of Pose6D along a line ±half_length from target at fixed height, camera pointing down at the target. The rest are hardware drivers for whatever arm you're using.
+flip hardware	
+    pickup_object / flip_object / release_object in robotic_arm.py have scaffolding but no suction solenoid trigger. Wire up however the suction is controlled (relay, ESP32 GPIO, etc.) inside the `print("[RoboticArm] Activating Suction.")` placeholder.
 
-interfaces/vision.py	
-    detect_object currently raises NotImplementedError. Suggested baseline is in the docstring — depth-threshold the table plane, connected-components, pick the largest blob, return its centroid + bbox as an ObjectState. Without this, the orchestrator aborts in Phase 1.
+detect_object world-frame coordinates	
+    The implemented detect_object returns centroid in camera space. For full orchestrator use, call arm.get_current_pose() before detect_object and apply the camera→world transform. For run_single_pass.py, pass --object-x/y/z manually.
 
 🟡 Wiring gap (silent but broken)
 The depth enhancer isn't called yet. Two options, pick one:
 
 Apply it inside VisionSystem.capture_rgbd() before returning.
 
-Or let the orchestrator apply it: add self.enhancer = DepthEnhancer() to ScanOrchestrator.__init__, then in _capture_at do frame = self.enhancer.process(frame) before building the CapturedView.
+Or let the orchestrator apply it: add self.enhancer = DepthEnhancer() to ScanOrchestrator.__init__, then call frame = self.enhancer.process(frame) inside _run_wrist_roll_scan.
 
-I'd put it in VisionSystem — the rest of the pipeline shouldn't need to know depth arrives pre-cleaned.
+Recommend putting it in VisionSystem — the rest of the pipeline shouldn't need to know depth arrives pre-cleaned.
 
 🟢 Polish, not blocking
 webserver/onshape.py _post_direct_stub — implement if you want to skip the ESP32 bridge during dev. Requires HMAC request signing.
@@ -226,16 +293,12 @@ Camera-only: instantiate VisionSystem() in a REPL, call capture_rgbd(), save the
 
 Camera + enhancer: same, but run the frame through DepthEnhancer().process() — compare before/after PNGs for speckle removal.
 
-Arm-only: manually drive the arm to a few poses, confirm get_current_pose() matches what you commanded within a few mm.
+Arm-only: manually drive the arm to a few poses using test_arm_hardware.py, confirm get_current_pose() matches what you commanded within a few mm. Test rotate_wrist_roll() directly.
 
-Arc trajectory: call arm.get_arc_trajectory("x", object_pose, 5) and step through the returned poses manually — check the camera is pointing at the object at each.
+Single-pass scan (depth camera + arm): python run_single_pass.py --object-x 0.20 --visualize. This is the key first end-to-end test — 4 frames, TSDF mesh, viewer.
 
-Full orchestrator, mock vision: stub VisionSystem.detect_object with a hardcoded centroid, run ScanOrchestrator.run_full_scan(). Confirms the arm sequence end-to-end.
-
-Full scan with real detect_object: once detect_object works, repeat — chamfer vs. a known-size test object (e.g. a 3D-printed cube).
+Full orchestrator (two-pass with flip): once suction is wired, run ScanOrchestrator.run_full_scan(). Confirms flip + alignment + full TSDF.
 
 Web dashboard: uvicorn GRANT.webserver.server:app --port 8000, open http://localhost:8000/, Start Scan. Watch phase/progress/heatmap update.
 
 ESP32 bridge + Onshape: last — once everything else works.
-
-Priority for today: the arm driver (step 2 blocks step 3, which blocks step 4, etc.). detect_object can come after — stub it with a hardcoded centroid for now and work on the arm.

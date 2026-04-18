@@ -15,33 +15,25 @@ from .scan_types import (
 
 class ScanOrchestrator:
     """
-    Fixed-trajectory scan with one arm that does both duties — it carries
-    the depth camera for the sweeps and carries the suction gripper for
-    the mid-scan flip.
+    Fixed-trajectory scan with one arm that carries the depth camera (mounted
+    at an angle) and a suction gripper for the mid-scan flip.
 
-    Sweep pattern: a CROSS parallel to the table. Two orthogonal linear
-    sweeps, both at constant height above the tabletop, meeting over the
-    object. One runs along the table's X axis, the other along Y. At each
-    step the arm pauses briefly so the camera can stabilize before the
-    capture (the depth pipeline has motion-induced lag).
+    Sweep pattern: the arm moves to a fixed position directly overhead the
+    object, then rotates the wrist_roll through four angles (-90°, 0°, 90°,
+    180°). Because the camera is tilted relative to the wrist, each rotation
+    exposes a different side of the object to the depth sensor.
 
     Flow:
         1. Detect object on the table.
-        2. Orientation 1: X sweep, then Y sweep (forming a cross above the object).
+        2. Orientation 1: move overhead, capture at 4 wrist-roll angles.
         3. Flip: arm picks up, rotates ~180° about a horizontal axis,
            sets the object back on the table, releases.
         4. Re-detect object.
-        5. Orientation 2: X + Y sweeps again.
+        5. Orientation 2: overhead + 4 wrist-roll angles again.
         6. Cross-orientation RANSAC+ICP align, TSDF-fuse every frame.
-
-    The object is NOT held during capture — it sits on the table. The
-    gripper is mounted so it's out of the camera's frame at all sweep
-    poses, so there's no arm to segment out.
     """
 
-    ARC_STEPS_X = 12
-    ARC_STEPS_Y = 12
-    SETTLE_TIME_S = 0.15         # pause after each move for camera/arm to stabilize
+    SETTLE_TIME_S = 0.5          # pause after wrist rotation for camera to stabilize
     MIN_ALIGNMENT_FITNESS = 0.3
 
     def __init__(
@@ -58,6 +50,30 @@ class ScanOrchestrator:
 
     # ──────────────────────────────────────────────────────────────────
 
+    def run_single_pass_scan(self) -> ScanResult:
+        """One overhead wrist-roll pass without flipping. Use this for initial testing."""
+
+        # ── Phase 1: Detect object ───────────────────────────────────
+        init_frame = self.vision.capture_rgbd()
+        object_state = self.vision.detect_object(init_frame)
+
+        # ── Phase 2: Overhead wrist-roll scan ────────────────────────
+        views = self._run_wrist_roll_scan(object_state, phase="orient-1")
+
+        # ── Phase 3: Home ────────────────────────────────────────────
+        self.arm.move_to_home()
+
+        # ── Phase 4: TSDF fusion ─────────────────────────────────────
+        mesh = self.registration.tsdf_fuse(views)
+        cloud = self._fuse_views_to_cloud(views)
+
+        return ScanResult(
+            mesh=mesh,
+            point_cloud=cloud,
+            n_frames=len(views),
+            alignment_fitness=1.0,
+        )
+
     def run_full_scan(self) -> ScanResult:
 
         # ── Phase 1: Detect object ───────────────────────────────────
@@ -65,7 +81,7 @@ class ScanOrchestrator:
         object_state = self.vision.detect_object(init_frame)
 
         # ── Phase 2: Orientation 1 scan ──────────────────────────────
-        views_orient_1 = self._run_both_arcs(object_state, phase="orient-1")
+        views_orient_1 = self._run_wrist_roll_scan(object_state, phase="orient-1")
 
         # ── Phase 3: Flip (pickup → flip → release) ──────────────────
         self._flip_object_in_place(object_state.centroid_as_pose())
@@ -75,7 +91,7 @@ class ScanOrchestrator:
         object_state = self.vision.detect_object(refresh_frame)
 
         # ── Phase 5: Orientation 2 scan ──────────────────────────────
-        views_orient_2 = self._run_both_arcs(object_state, phase="orient-2")
+        views_orient_2 = self._run_wrist_roll_scan(object_state, phase="orient-2")
 
         # ── Phase 6: Send arm home ───────────────────────────────────
         self.arm.move_to_home()
@@ -120,38 +136,28 @@ class ScanOrchestrator:
     # Helpers
     # ──────────────────────────────────────────────────────────────────
 
-    def _run_both_arcs(
+    def _run_wrist_roll_scan(
         self,
         object_state: ObjectState,
         phase: str = "orient-1",
     ) -> list[CapturedView]:
-        """Run the two legs of the cross: X sweep, then Y sweep."""
+        """Move overhead, then capture at each wrist-roll angle."""
         target = object_state.centroid_as_pose()
-        x_poses = self.arm.get_arc_trajectory(
-            axis="x", target=target, n_steps=self.ARC_STEPS_X
-        )
-        y_poses = self.arm.get_arc_trajectory(
-            axis="y", target=target, n_steps=self.ARC_STEPS_Y
-        )
-        poses = x_poses + y_poses
+        overhead = self.arm.get_overhead_pose(target)
+        self.arm.move_to_pose(overhead, phase="grip")
 
         views: list[CapturedView] = []
-        for i, pose in enumerate(poses):
-            view = self._capture_at(pose)
+        n = len(self.arm.WRIST_ROLL_SCAN_ANGLES)
+        for i, angle_deg in enumerate(self.arm.WRIST_ROLL_SCAN_ANGLES):
+            self.arm.rotate_wrist_roll(angle_deg)
+            time.sleep(self.SETTLE_TIME_S)
+            actual_pose = self.arm.get_current_pose()
+            frame = self.vision.capture_rgbd()
+            view = CapturedView(frame=frame, camera_pose=actual_pose)
             views.append(view)
             if self.on_view_captured is not None:
-                self.on_view_captured(view, phase, i, len(poses))
+                self.on_view_captured(view, phase, i, n)
         return views
-
-    def _capture_at(self, camera_pose: Pose6D) -> CapturedView:
-        # Discrete motion: move, wait for the servos+camera to settle, then
-        # capture. The depth pipeline has non-trivial lag; grabbing a frame
-        # while the arm is still moving smears the disparity.
-        self.arm.move_to_pose(camera_pose)
-        time.sleep(self.SETTLE_TIME_S)
-        actual_pose = self.arm.get_current_pose()
-        frame = self.vision.capture_rgbd()
-        return CapturedView(frame=frame, camera_pose=actual_pose)
 
     def _flip_object_in_place(self, target_pose: Pose6D) -> None:
         grip = self.arm.pickup_object(target_pose=target_pose)

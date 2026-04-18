@@ -1,7 +1,10 @@
 import numpy as np
 import open3d as o3d
 
-from .scan_types import CapturedView, PointCloud, Pose6D
+try:
+    from .scan_types import CapturedView, PointCloud, Pose6D
+except ImportError:
+    from scan_types import CapturedView, PointCloud, Pose6D
 
 
 class Registration:
