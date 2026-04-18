@@ -12,7 +12,8 @@ class VisionSystem:
         """
         self.fps = 25.0
         self.pipeline = dai.Pipeline()
-        self.platform = self.pipeline.getDefaultDevice().getPlatform()
+        self.device = self.pipeline.getDefaultDevice()
+        self.platform = self.device.getPlatform()
 
         # Define sources and outputs
         camRgb = self.pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
@@ -49,19 +50,23 @@ class VisionSystem:
         # Start the pipeline
         self.pipeline.start()
 
-        # Attempt to read exact camera intrinsics; provide fallback if calibration fails
+        # Attempt to read exact camera intrinsics; provide fallback if calibration fails.
+        # IMPORTANT: pass resize dimensions — calibration stores intrinsics at the
+        # sensor's native resolution, so without resize args the fx/fy/cx/cy will not
+        # match the 1280x960 RGB output and point-cloud backprojection will be skewed.
         try:
-            calibData = self.pipeline.getDefaultDevice().readCalibration()
-            # We fetch CAM_A (RGB) intrinsics because the depth map is aligned to the RGB frame
-            intrinsics_matrix = calibData.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A)
+            calibData = self.device.readCalibration()
+            intrinsics_matrix = calibData.getCameraIntrinsics(
+                dai.CameraBoardSocket.CAM_A, resizeWidth=1280, resizeHeight=960,
+            )
             self.intrinsics = CameraIntrinsics(
                 fx=intrinsics_matrix[0][0], fy=intrinsics_matrix[1][1],
                 cx=intrinsics_matrix[0][2], cy=intrinsics_matrix[1][2],
-                width=1280, height=960
+                width=1280, height=960,
             )
         except Exception:
             self.intrinsics = CameraIntrinsics(
-                fx=1000.0, fy=1000.0, cx=640.0, cy=480.0, width=1280, height=960
+                fx=1000.0, fy=1000.0, cx=640.0, cy=480.0, width=1280, height=960,
             )
 
     def capture_rgbd(self) -> RGBDFrame:
@@ -90,21 +95,41 @@ class VisionSystem:
             rgb=rgb_array,
             depth=depth_array_meters,
             intrinsics=self.intrinsics,
-            arm_mask=None
         )
 
     def detect_object(self, frame: RGBDFrame) -> ObjectState:
         """
-        Called once at scan start.
+        Called once at scan start (and again after the flip).
         Segments the object from background using depth discontinuities.
-        Returns bounding box, centroid, initial coverage map (all zeros).
+
+        TODO: implement. A reasonable baseline:
+          1. Crop depth to the table region (known from the arm's workspace).
+          2. Threshold pixels whose depth is closer than the table plane.
+          3. Connected-components; pick the largest.
+          4. Centroid + axis-aligned bbox become the ObjectState.
         """
-        pass
+        raise NotImplementedError(
+            "detect_object not implemented — see docstring for suggested approach"
+        )
 
     def frame_to_pointcloud(self, frame: RGBDFrame) -> PointCloud:
         """
-        Backprojects depth map through camera intrinsics to 3D points.
-        Colors from RGB frame.
-        Returns point cloud in camera space — caller transforms to world space.
+        Backproject depth through the pinhole intrinsics and carry RGB per point.
+        Returns the cloud in camera space — the caller transforms to world.
         """
-        pass
+        intr = frame.intrinsics
+        depth = frame.depth
+        h, w = depth.shape
+        ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+        valid = depth > 0
+
+        z = depth[valid]
+        x = (xs[valid] - intr.cx) / intr.fx * z
+        y = (ys[valid] - intr.cy) / intr.fy * z
+        points = np.stack([x, y, z], axis=-1).astype(np.float32)
+
+        colors = None
+        if frame.rgb is not None and frame.rgb.shape[:2] == depth.shape:
+            colors = frame.rgb[valid].astype(np.uint8)
+
+        return PointCloud(points=points, colors=colors)

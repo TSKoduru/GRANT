@@ -40,14 +40,19 @@ class RoboticArm:
 
     def get_arc_trajectory(
         self,
-        axis: str,                 # "azimuth" (left→right) or "elevation" (top→bottom)
+        axis: str,                 # "x" (along table X) or "y" (along table Y)
         target: Pose6D,            # point to aim the camera at (object centroid)
         n_steps: int = 12,
     ) -> list[Pose6D]:
         """
-        Pre-baked camera sweep around `target` along one axis. The
-        orchestrator walks this list in order, calling move_to_pose
-        then capturing a frame at each step.
+        Discrete camera sweep along one leg of the cross. The returned
+        poses lie in a plane parallel to the table at fixed height above
+        the object; the camera is aimed at `target` at every step. The
+        orchestrator walks this list in order and pauses between moves
+        so the camera has time to settle.
+
+        axis="x" → sweep along table X (camera moves left↔right)
+        axis="y" → sweep along table Y (camera moves front↔back)
         """
 
     # ── Gripping (no seal verification) ─────────────────────────────

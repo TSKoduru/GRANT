@@ -160,46 +160,30 @@ def matrix_to_pose6d(T: np.ndarray) -> Pose6D:
 # Arc trajectories
 # ──────────────────────────────────────────────────────────────────────
 
-def azimuth_arc(
-    target: np.ndarray, radius: float, elevation: float, n_steps: int,
-    azimuth_range: tuple[float, float] = (-math.pi * 0.8, math.pi * 0.8),
+def cross_arc(
+    target: np.ndarray,
+    axis: str,                         # "x" or "y"
+    half_length: float,                # ± distance from center along the axis (m)
+    height: float,                     # constant Z above the object (m)
+    n_steps: int,
 ) -> list[np.ndarray]:
-    """Camera sweeps around Z axis at fixed elevation — left to right."""
-    up = np.array([0.0, 0.0, 1.0])
-    poses = []
-    for i in range(n_steps):
-        t = i / max(n_steps - 1, 1)
-        theta = azimuth_range[0] + t * (azimuth_range[1] - azimuth_range[0])
-        eye = target + np.array([
-            radius * math.cos(theta),
-            radius * math.sin(theta),
-            elevation,
-        ])
-        poses.append(look_at(eye, target, up))
-    return poses
-
-
-def elevation_arc(
-    target: np.ndarray, radius: float, azimuth: float, n_steps: int,
-    elevation_range: tuple[float, float] = (0.05, math.pi / 2 - 0.15),
-) -> list[np.ndarray]:
-    """Camera sweeps over the top — 'top to bottom' in elevation angle."""
+    """
+    One leg of the cross-parallel-to-table sweep. The camera moves in a
+    straight line at constant height above the object, always aiming down
+    at `target`. Two such legs (axis="x", axis="y") form the cross.
+    """
     up_world = np.array([0.0, 0.0, 1.0])
     poses = []
     for i in range(n_steps):
         t = i / max(n_steps - 1, 1)
-        # Sweep from high elevation (top) down to near-horizontal
-        phi = elevation_range[1] - t * (elevation_range[1] - elevation_range[0])
-        horizontal = radius * math.cos(phi)
-        eye = target + np.array([
-            horizontal * math.cos(azimuth),
-            horizontal * math.sin(azimuth),
-            radius * math.sin(phi),
-        ])
-        # If camera is nearly directly overhead, use X-axis as up to avoid
-        # degenerate forward×up cross product.
-        up = up_world if phi < math.pi / 2 - 0.2 else np.array([1.0, 0.0, 0.0])
-        poses.append(look_at(eye, target, up))
+        offset = -half_length + t * 2.0 * half_length
+        if axis == "x":
+            eye = target + np.array([offset, 0.0, height])
+        elif axis == "y":
+            eye = target + np.array([0.0, offset, height])
+        else:
+            raise ValueError(f"axis must be 'x' or 'y', got {axis!r}")
+        poses.append(look_at(eye, target, up_world))
     return poses
 
 
@@ -281,16 +265,20 @@ def run_arcs(
     scene: o3d.t.geometry.RaycastingScene,
     intrinsics: CameraIntrinsics,
     object_center: np.ndarray,
-    n_az: int,
-    n_el: int,
-    radius: float,
+    n_x: int,
+    n_y: int,
+    half_length: float,
+    height: float,
     noise_std: float,
     fk_drift_std: float,
 ) -> list[CapturedView]:
+    """Run both legs of the cross parallel to the table."""
     views: list[CapturedView] = []
-    for T in azimuth_arc(object_center, radius=radius, elevation=0.04, n_steps=n_az):
+    for T in cross_arc(object_center, axis="x",
+                       half_length=half_length, height=height, n_steps=n_x):
         views.append(simulate_view(scene, intrinsics, T, noise_std, fk_drift_std))
-    for T in elevation_arc(object_center, radius=radius, azimuth=0.0, n_steps=n_el):
+    for T in cross_arc(object_center, axis="y",
+                       half_length=half_length, height=height, n_steps=n_y):
         views.append(simulate_view(scene, intrinsics, T, noise_std, fk_drift_std))
     return views
 
@@ -329,9 +317,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--shape", choices=["sphere", "box", "bunny", "armadillo", "knot"],
                     default="bunny")
-    ap.add_argument("--n-az", type=int, default=14, help="Azimuth arc steps")
-    ap.add_argument("--n-el", type=int, default=8, help="Elevation arc steps")
-    ap.add_argument("--radius", type=float, default=0.25, help="Camera orbit radius (m)")
+    ap.add_argument("--n-x", type=int, default=12, help="Cross X-axis sweep steps")
+    ap.add_argument("--n-y", type=int, default=12, help="Cross Y-axis sweep steps")
+    ap.add_argument("--half-length", type=float, default=0.18,
+                    help="Half-length of each cross leg (m) — camera goes ± this far")
+    ap.add_argument("--height", type=float, default=0.22,
+                    help="Height of camera above the object (m)")
     ap.add_argument("--noise-std", type=float, default=0.0008, help="Depth sensor noise (m)")
     ap.add_argument("--fk-drift-std", type=float, default=0.002,
                     help="Per-view FK position drift (m)")
@@ -362,7 +353,8 @@ def main() -> None:
     views_1 = run_arcs(
         scene_1, intrinsics,
         object_center=np.zeros(3),
-        n_az=args.n_az, n_el=args.n_el, radius=args.radius,
+        n_x=args.n_x, n_y=args.n_y,
+        half_length=args.half_length, height=args.height,
         noise_std=args.noise_std, fk_drift_std=args.fk_drift_std,
     )
     print(f"[orient-1] captured {len(views_1)} views")
@@ -380,7 +372,8 @@ def main() -> None:
     views_2 = run_arcs(
         scene_2, intrinsics,
         object_center=center_2,
-        n_az=args.n_az, n_el=args.n_el, radius=args.radius,
+        n_x=args.n_x, n_y=args.n_y,
+        half_length=args.half_length, height=args.height,
         noise_std=args.noise_std, fk_drift_std=args.fk_drift_std,
     )
     print(f"[orient-2] captured {len(views_2)} views")

@@ -1,3 +1,5 @@
+import time
+
 from .interfaces.robotic_arm import RoboticArm
 from .interfaces.vision import VisionSystem
 from .registration import Registration
@@ -17,26 +19,29 @@ class ScanOrchestrator:
     the depth camera for the sweeps and carries the suction gripper for
     the mid-scan flip.
 
-    Flow:
+    Sweep pattern: a CROSS parallel to the table. Two orthogonal linear
+    sweeps, both at constant height above the tabletop, meeting over the
+    object. One runs along the table's X axis, the other along Y. At each
+    step the arm pauses briefly so the camera can stabilize before the
+    capture (the depth pipeline has motion-induced lag).
 
+    Flow:
         1. Detect object on the table.
-        2. Orientation 1:
-             arc 1 — camera sweeps left→right (azimuth)
-             arc 2 — camera sweeps top→bottom (elevation)
-        3. Flip: arm picks up the object, rotates ~180° about a horizontal
-           axis, sets it back on the table, releases.
-        4. Re-detect object (flip drops it at a slightly different spot).
-        5. Orientation 2: arcs 1+2 again.
-        6. Stitch orientations together with RANSAC+ICP on the accumulated
-           point clouds, then TSDF-fuse every frame.
+        2. Orientation 1: X sweep, then Y sweep (forming a cross above the object).
+        3. Flip: arm picks up, rotates ~180° about a horizontal axis,
+           sets the object back on the table, releases.
+        4. Re-detect object.
+        5. Orientation 2: X + Y sweeps again.
+        6. Cross-orientation RANSAC+ICP align, TSDF-fuse every frame.
 
     The object is NOT held during capture — it sits on the table. The
     gripper is mounted so it's out of the camera's frame at all sweep
-    poses, so there's no pickup-arm to segment out.
+    poses, so there's no arm to segment out.
     """
 
-    ARC_STEPS_AZIMUTH = 12
-    ARC_STEPS_ELEVATION = 8
+    ARC_STEPS_X = 12
+    ARC_STEPS_Y = 12
+    SETTLE_TIME_S = 0.15         # pause after each move for camera/arm to stabilize
     MIN_ALIGNMENT_FITNESS = 0.3
 
     def __init__(
@@ -44,10 +49,12 @@ class ScanOrchestrator:
         arm: RoboticArm,
         vision: VisionSystem,
         registration: Registration,
+        on_view_captured=None,   # optional: callable(CapturedView, phase, i, n) for live UI
     ):
         self.arm = arm
         self.vision = vision
         self.registration = registration
+        self.on_view_captured = on_view_captured
 
     # ──────────────────────────────────────────────────────────────────
 
@@ -58,7 +65,7 @@ class ScanOrchestrator:
         object_state = self.vision.detect_object(init_frame)
 
         # ── Phase 2: Orientation 1 scan ──────────────────────────────
-        views_orient_1 = self._run_both_arcs(object_state)
+        views_orient_1 = self._run_both_arcs(object_state, phase="orient-1")
 
         # ── Phase 3: Flip (pickup → flip → release) ──────────────────
         self._flip_object_in_place(object_state.centroid_as_pose())
@@ -68,7 +75,7 @@ class ScanOrchestrator:
         object_state = self.vision.detect_object(refresh_frame)
 
         # ── Phase 5: Orientation 2 scan ──────────────────────────────
-        views_orient_2 = self._run_both_arcs(object_state)
+        views_orient_2 = self._run_both_arcs(object_state, phase="orient-2")
 
         # ── Phase 6: Send arm home ───────────────────────────────────
         self.arm.move_to_home()
@@ -113,21 +120,35 @@ class ScanOrchestrator:
     # Helpers
     # ──────────────────────────────────────────────────────────────────
 
-    def _run_both_arcs(self, object_state: ObjectState) -> list[CapturedView]:
-        views: list[CapturedView] = []
+    def _run_both_arcs(
+        self,
+        object_state: ObjectState,
+        phase: str = "orient-1",
+    ) -> list[CapturedView]:
+        """Run the two legs of the cross: X sweep, then Y sweep."""
         target = object_state.centroid_as_pose()
-        azimuth_poses = self.arm.get_arc_trajectory(
-            axis="azimuth", target=target, n_steps=self.ARC_STEPS_AZIMUTH
+        x_poses = self.arm.get_arc_trajectory(
+            axis="x", target=target, n_steps=self.ARC_STEPS_X
         )
-        elevation_poses = self.arm.get_arc_trajectory(
-            axis="elevation", target=target, n_steps=self.ARC_STEPS_ELEVATION
+        y_poses = self.arm.get_arc_trajectory(
+            axis="y", target=target, n_steps=self.ARC_STEPS_Y
         )
-        for pose in azimuth_poses + elevation_poses:
-            views.append(self._capture_at(pose))
+        poses = x_poses + y_poses
+
+        views: list[CapturedView] = []
+        for i, pose in enumerate(poses):
+            view = self._capture_at(pose)
+            views.append(view)
+            if self.on_view_captured is not None:
+                self.on_view_captured(view, phase, i, len(poses))
         return views
 
     def _capture_at(self, camera_pose: Pose6D) -> CapturedView:
+        # Discrete motion: move, wait for the servos+camera to settle, then
+        # capture. The depth pipeline has non-trivial lag; grabbing a frame
+        # while the arm is still moving smears the disparity.
         self.arm.move_to_pose(camera_pose)
+        time.sleep(self.SETTLE_TIME_S)
         actual_pose = self.arm.get_current_pose()
         frame = self.vision.capture_rgbd()
         return CapturedView(frame=frame, camera_pose=actual_pose)
