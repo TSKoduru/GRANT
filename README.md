@@ -62,8 +62,7 @@ It is the autoresearch paradigm (LLM edits its own code on a measured objective)
                               ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │           HARDWARE — AMD-powered LeRobot SO-101 + Perception         │
-│   SO-101 on LeRobot • overhead + wrist cams • FPGA-accelerated       │
-│   HSV segmentation • homography + FK • ESP32 live dashboard          │
+│   SO-101 on LeRobot • overhead + wrist cams • homography + FK        │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -71,7 +70,7 @@ It is the autoresearch paradigm (LLM edits its own code on a measured objective)
 
 ## Hardware Integration
 
-### AMD AI PC + FPGA + LeRobot SO-101 (AMD Track)
+### AMD AI PC + LeRobot SO-101 (AMD Track)
 
 The AI PC is the brain of the autoresearch loop, the FPGA is the accelerator on the perception path, and the LeRobot SO-101 is the body they drive. All three are one integrated stack.
 
@@ -82,12 +81,6 @@ The AI PC is the brain of the autoresearch loop, the FPGA is the accelerator on 
 - **Homography-based workspace calibration** — 4 ArUco markers on a mat, jogged to with the arm itself, give a pixel → millimeter map in 5 minutes to ~2 mm accuracy
 
 **AI PC — the researcher host.** The  AI PC runs the researcher loop, the trial runner, and the LLM backend. 
-
-**FPGA — vision segmentation accelerator.** HSV color segmentation is the per-frame hot path that finds the object in every trial image. We offload it to an AMD FPGA streaming pipeline so the perception loop keeps up with camera framerate while the CPU is busy doing planner + researcher work. The FPGA takes raw camera frames and emits object-center pixel coordinates; everything downstream (homography, scoring, LLM context) runs off that stream.
-
-### Smart Home / City Theme + Espressif ESP32 Dashboard (Espressif Track)
-
-A household or city-scale robot meets an endless variety of objects — groceries, packages, laundry, parcels on a curb. G.R.A.N.T. is the control layer that makes an at-home or curbside manipulator viable.
 
 ### Ford Novel Gripper Challenge (Ford Track)
 
@@ -148,9 +141,6 @@ Most adaptive-manipulation work is either (a) deep RL in simulation with massive
 - **Converges in minutes on real hardware** — not millions of sim steps
 - **Zero retraining** when the gripper changes — just new trials
 - **Deterministic, auditable scoring** — no black-box reward model
-- **Runs on-device** on AMD AI PC, with FPGA-accelerated vision and cloud-LLM fallback for reasoning
-- **Makes training legible** — an ESP32 dashboard streams live convergence to anyone on the Wi-Fi
-- **Generalizes across gripper modifications** we never designed for — exactly Ford's ask
 
 The underlying technique (autoresearch: LLM-driven code evolution against a measured objective) is bleeding-edge for ML training. We believe this is one of its first serious applications to physical manipulation.
 
